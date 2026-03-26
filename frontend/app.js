@@ -195,8 +195,9 @@ async function sendMessage() {
     const decoder = new TextDecoder();
     let   full    = '';
     let   buffer  = '';
+    let   streamDone = false;
 
-    while (true) {
+    while (!streamDone) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
@@ -206,7 +207,7 @@ async function sendMessage() {
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const data = line.slice(6).trim();
-        if (data === '[DONE]') break;
+        if (data === '[DONE]') { streamDone = true; break; }
         try {
           const parsed = JSON.parse(data);
           if (parsed.token) {
@@ -218,6 +219,8 @@ async function sendMessage() {
         } catch {}
       }
     }
+
+    reader.cancel().catch(() => {});
 
     // Final render — remove cursor
     bubbleEl.innerHTML = formatMsg(full);

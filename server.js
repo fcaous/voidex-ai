@@ -242,13 +242,17 @@ function callGroq(messages, stream, res) {
         res.setHeader('Connection',    'keep-alive');
         res.flushHeaders();
 
-        let full = '';
+        let full    = '';
+        let settled = false;
+
         groqRes.on('data', (chunk) => {
+          if (settled) return;
           const lines = chunk.toString().split('\n');
           for (const line of lines) {
             if (!line.startsWith('data: ')) continue;
             const data = line.slice(6).trim();
             if (data === '[DONE]') {
+              settled = true;
               res.write(`data: [DONE]\n\n`);
               resolve(full);
               return;
@@ -263,8 +267,8 @@ function callGroq(messages, stream, res) {
             } catch {}
           }
         });
-        groqRes.on('end', () => resolve(full));
-        groqRes.on('error', reject);
+        groqRes.on('end', () => { if (!settled) { settled = true; resolve(full); } });
+        groqRes.on('error', (err) => { if (!settled) { settled = true; reject(err); } });
       }
     });
 
