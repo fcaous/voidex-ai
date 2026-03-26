@@ -1,507 +1,477 @@
 /*
-  VOIDEX AI — app.js
+  VOIDEX AI — server.js
   Made by Aousisgood1
+  Groq AI + Supabase storage
 */
 
-const API = window.location.origin;
+const express = require('express');
+const cors    = require('cors');
+const crypto  = require('crypto');
+const https   = require('https');
+const http    = require('http');
+const path    = require('path');
 
-// ── State ────────────────────────────────
-let userId      = getOrCreateUserId();
-let currentChat = null;  // { id, messages, title }
-let isLoading   = false;
-let ownerAuthed = false;
-let ownerPw     = '';
+const app     = express();
+const PORT    = process.env.PORT || 3001;
+const VERSION = '1.0.0';
 
-// ── User ID (persisted) ───────────────────
-function getOrCreateUserId() {
-  let id = localStorage.getItem('vx_ai_uid');
-  if (!id) {
-    id = 'u_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-    localStorage.setItem('vx_ai_uid', id);
+const OWNER_PASSWORD = process.env.OWNER_PASSWORD || 'VOIDEX_OWNER_2026';
+const GROQ_API_KEY   = process.env.GROQ_API_KEY   || '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';
+const SUPABASE_URL   = process.env.SUPABASE_URL;
+const SUPABASE_KEY   = process.env.SUPABASE_KEY;
+
+// Daily message limit per user (based on browser fingerprint)
+const DAILY_LIMIT = 30;
+
+app.use(cors({ origin: '*' }));
+app.use(express.json({ limit: '2mb' }));
+app.use(express.static(path.join(__dirname, 'frontend')));
+
+// ══════════════════════════════════════════
+//  IN-MEMORY FALLBACK (if no Supabase)
+// ══════════════════════════════════════════
+let _memSettings = {};
+let _memChats    = {};
+let _memLimits   = {};
+
+// ══════════════════════════════════════════
+//  SUPABASE CLIENT
+// ══════════════════════════════════════════
+function sbReq(method, table, body, query) {
+  return new Promise((resolve, reject) => {
+    if (!SUPABASE_URL || !SUPABASE_KEY) return reject(new Error('no_supabase'));
+    const url  = new URL(`${SUPABASE_URL}/rest/v1/${table}${query || ''}`);
+    const data = body ? JSON.stringify(body) : '';
+    const opts = {
+      hostname: url.hostname,
+      path:     url.pathname + url.search,
+      method,
+      headers: {
+        'apikey':        SUPABASE_KEY,
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'Content-Type':  'application/json',
+        'Prefer':        'return=representation',
+      },
+    };
+    if (data) opts.headers['Content-Length'] = Buffer.byteLength(data);
+    const req = https.request(opts, (res) => {
+      let raw = '';
+      res.on('data', c => raw += c);
+      res.on('end', () => {
+        try {
+          if (res.statusCode >= 400) reject(new Error(`SB${res.statusCode}: ${raw.slice(0,200)}`));
+          else resolve(raw ? JSON.parse(raw) : null);
+        } catch { resolve(raw); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(8000, () => { req.destroy(); reject(new Error('timeout')); });
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+// ── SETTINGS ──────────────────────────────
+const DEFAULT_PROMPT = `You are Voidex AI, an expert assistant for a Roblox tapping simulation game called "Tapping Simulator" (or similar). You help players with everything about the game.
+
+WHAT YOU KNOW:
+- Pet values, tiers, and rarities (Secret > Mythic > Legendary > Epic > Rare > Uncommon > Common)
+- Enchant comparisons and recommendations
+- Game strategy and progression tips
+- Trading advice and market knowledge
+- Auto-clicking setups and optimization
+- Rebirth timing and multipliers
+
+PERSONALITY:
+- Friendly, concise, and helpful
+- Give clear YES/NO answers when comparing two options
+- Always explain WHY when recommending something
+- If you don't know a specific value, say so honestly and suggest how to find it
+- Use simple language, players may be young
+
+IMPORTANT:
+- Secret pets are the rarest and most valuable
+- Always prioritize the player's progression level when giving advice
+- When comparing enchants, consider: damage output, tap speed, luck/rarity bonuses`;
+
+async function getPrompt() {
+  try {
+    if (SUPABASE_URL) {
+      const rows = await sbReq('GET', 'settings', null, '?key=eq.ai_prompt&select=value');
+      if (rows && rows.length > 0) return rows[0].value;
+    }
+    return _memSettings['ai_prompt'] || DEFAULT_PROMPT;
+  } catch { return _memSettings['ai_prompt'] || DEFAULT_PROMPT; }
+}
+
+async function setPrompt(value) {
+  _memSettings['ai_prompt'] = value;
+  if (!SUPABASE_URL) return;
+  try {
+    const existing = await sbReq('GET', 'settings', null, '?key=eq.ai_prompt&select=key');
+    if (existing && existing.length > 0) {
+      await sbReq('PATCH', 'settings', { value, updated_at: new Date().toISOString() }, '?key=eq.ai_prompt');
+    } else {
+      await sbReq('POST', 'settings', { key: 'ai_prompt', value }, '');
+    }
+  } catch (e) { console.error('[AI] setPrompt:', e.message); }
+}
+
+// ── CHATS ─────────────────────────────────
+async function saveChat(chat) {
+  _memChats[chat.id] = chat;
+  if (!SUPABASE_URL) return;
+  try {
+    const existing = await sbReq('GET', 'ai_chats', null, `?id=eq.${chat.id}&select=id`);
+    if (existing && existing.length > 0) {
+      await sbReq('PATCH', 'ai_chats', { data: chat, updated_at: new Date().toISOString() }, `?id=eq.${chat.id}`);
+    } else {
+      await sbReq('POST', 'ai_chats', { id: chat.id, user_id: chat.userId, data: chat }, '');
+    }
+  } catch (e) { console.error('[AI] saveChat:', e.message); }
+}
+
+async function getUserChats(userId) {
+  if (SUPABASE_URL) {
+    try {
+      const rows = await sbReq('GET', 'ai_chats', null, `?user_id=eq.${encodeURIComponent(userId)}&select=id,data&order=updated_at.desc&limit=20`);
+      return (rows || []).map(r => r.data);
+    } catch {}
   }
-  return id;
+  return Object.values(_memChats).filter(c => c.userId === userId).sort((a,b) => b.updatedAt - a.updatedAt).slice(0, 20);
+}
+
+async function getChat(id) {
+  if (SUPABASE_URL) {
+    try {
+      const rows = await sbReq('GET', 'ai_chats', null, `?id=eq.${encodeURIComponent(id)}&select=data`);
+      if (rows && rows.length > 0) return rows[0].data;
+    } catch {}
+  }
+  return _memChats[id] || null;
+}
+
+async function deleteChat(id) {
+  delete _memChats[id];
+  if (!SUPABASE_URL) return;
+  try { await sbReq('DELETE', 'ai_chats', null, `?id=eq.${encodeURIComponent(id)}`); }
+  catch {}
+}
+
+// ── RATE LIMITS ───────────────────────────
+function todayKey() {
+  return new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+}
+
+async function getUsage(userId) {
+  const key = `${userId}_${todayKey()}`;
+  if (SUPABASE_URL) {
+    try {
+      const rows = await sbReq('GET', 'ai_usage', null, `?key=eq.${encodeURIComponent(key)}&select=count`);
+      return rows && rows.length > 0 ? rows[0].count : 0;
+    } catch {}
+  }
+  return _memLimits[key] || 0;
+}
+
+async function incrementUsage(userId) {
+  const key   = `${userId}_${todayKey()}`;
+  const count = (await getUsage(userId)) + 1;
+  _memLimits[key] = count;
+  if (SUPABASE_URL) {
+    try {
+      const existing = await sbReq('GET', 'ai_usage', null, `?key=eq.${encodeURIComponent(key)}&select=key`);
+      if (existing && existing.length > 0) {
+        await sbReq('PATCH', 'ai_usage', { count }, `?key=eq.${encodeURIComponent(key)}`);
+      } else {
+        await sbReq('POST', 'ai_usage', { key, user_id: userId, count, date: todayKey() }, '');
+      }
+    } catch {}
+  }
+  return count;
 }
 
 // ══════════════════════════════════════════
-//  INIT
+//  AUTH
 // ══════════════════════════════════════════
-document.addEventListener('DOMContentLoaded', () => {
-  loadChatList();
-  loadUsage();
+function authOwner(req, res, next) {
+  const pw = req.headers['x-owner-password'] || req.body?.ownerPassword || '';
+  if (pw !== OWNER_PASSWORD) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
 
-  // Triple-click logo → owner panel
-  let logoClicks = 0;
-  document.getElementById('logo-btn')?.addEventListener('click', () => {
-    logoClicks++;
-    if (logoClicks >= 3) { logoClicks = 0; openOwner(); }
-    setTimeout(() => logoClicks = 0, 800);
+// ══════════════════════════════════════════
+//  GROQ AI
+// ══════════════════════════════════════════
+function callGroq(messages, stream, res) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model:       'llama-3.3-70b-versatile',
+      messages,
+      max_tokens:  1024,
+      temperature: 0.7,
+      stream:      !!stream,
+    });
+
+    const opts = {
+      hostname: 'api.groq.com',
+      path:     '/openai/v1/chat/completions',
+      method:   'POST',
+      headers:  {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type':  'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(opts, (groqRes) => {
+      if (!stream) {
+        let raw = '';
+        groqRes.on('data', c => raw += c);
+        groqRes.on('end', () => {
+          try {
+            const data = JSON.parse(raw);
+            if (data.error) reject(new Error(data.error.message));
+            else resolve(data.choices[0].message.content);
+          } catch (e) { reject(e); }
+        });
+      } else {
+        // Stream to SSE response
+        res.setHeader('Content-Type',  'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection',    'keep-alive');
+        res.flushHeaders();
+
+        let full = '';
+        groqRes.on('data', (chunk) => {
+          const lines = chunk.toString().split('\n');
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const data = line.slice(6).trim();
+            if (data === '[DONE]') {
+              res.write(`data: [DONE]\n\n`);
+              resolve(full);
+              return;
+            }
+            try {
+              const parsed = JSON.parse(data);
+              const token  = parsed.choices?.[0]?.delta?.content || '';
+              if (token) {
+                full += token;
+                res.write(`data: ${JSON.stringify({ token })}\n\n`);
+              }
+            } catch {}
+          }
+        });
+        groqRes.on('end', () => resolve(full));
+        groqRes.on('error', reject);
+      }
+    });
+
+    req.on('error', reject);
+    req.setTimeout(30000, () => { req.destroy(); reject(new Error('Groq timeout')); });
+    req.write(body);
+    req.end();
   });
+}
 
-  // Enter to send
-  document.getElementById('msg-input')?.addEventListener('keydown', handleKey);
+// ══════════════════════════════════════════
+//  PUBLIC ROUTES
+// ══════════════════════════════════════════
 
-  // Focus input
-  document.getElementById('msg-input')?.focus();
+// Status
+app.get('/api/status', (req, res) => {
+  res.json({ version: VERSION, status: 'online', model: 'llama-3.3-70b-versatile', limit: DAILY_LIMIT });
+});
+
+// Get system prompt (public — needed to show in UI that AI is specialized)
+app.get('/api/ai/info', (req, res) => {
+  res.json({ model: 'Llama 3.3 70B', limit: DAILY_LIMIT, version: VERSION });
+});
+
+// ── CHAT ──────────────────────────────────
+
+// POST /api/ai/chat — main chat endpoint (streaming)
+app.post('/api/ai/chat', async (req, res) => {
+  const { messages, userId, chatId } = req.body;
+
+  if (!userId)   return res.status(400).json({ error: 'userId required' });
+  if (!messages || !messages.length) return res.status(400).json({ error: 'messages required' });
+
+  // Check rate limit
+  const usage = await getUsage(userId);
+  if (usage >= DAILY_LIMIT) {
+    return res.status(429).json({
+      error: `Daily limit reached (${DAILY_LIMIT} messages). Resets at midnight.`,
+      usage,
+      limit: DAILY_LIMIT,
+    });
+  }
+
+  // Build messages with system prompt
+  const systemPrompt = await getPrompt();
+  const fullMessages = [
+    { role: 'system', content: systemPrompt },
+    ...messages.slice(-20), // keep last 20 for context
+  ];
+
+  try {
+    // Increment usage before calling (prevents abuse)
+    const newUsage = await incrementUsage(userId);
+
+    // Stream response
+    const fullResponse = await callGroq(fullMessages, true, res);
+
+    // Save/update chat
+    if (chatId) {
+      const existing = await getChat(chatId) || { id: chatId, userId, title: '', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
+
+      // Auto-title from first user message
+      if (!existing.title && messages.length > 0) {
+        const firstMsg = messages.find(m => m.role === 'user');
+        existing.title = firstMsg ? firstMsg.content.slice(0, 50) + (firstMsg.content.length > 50 ? '...' : '') : 'New Chat';
+      }
+
+      existing.messages   = [...messages, { role: 'assistant', content: fullResponse }];
+      existing.updatedAt  = Date.now();
+      await saveChat(existing);
+    }
+
+    // If streaming already ended the response, we're done
+    if (!res.writableEnded) res.end();
+
+  } catch (err) {
+    console.error('[AI] Chat error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'AI error: ' + err.message });
+    } else {
+      res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+// GET /api/ai/usage/:userId
+app.get('/api/ai/usage/:userId', async (req, res) => {
+  const usage = await getUsage(req.params.userId);
+  res.json({ usage, limit: DAILY_LIMIT, remaining: Math.max(0, DAILY_LIMIT - usage) });
+});
+
+// GET /api/ai/chats/:userId
+app.get('/api/ai/chats/:userId', async (req, res) => {
+  const chats = await getUserChats(req.params.userId);
+  // Return summary only (no messages) for the list
+  res.json(chats.map(c => ({ id: c.id, title: c.title, updatedAt: c.updatedAt, messageCount: c.messages?.length || 0 })));
+});
+
+// GET /api/ai/chat/:id — get full chat
+app.get('/api/ai/chat/:id', async (req, res) => {
+  const chat = await getChat(req.params.id);
+  if (!chat) return res.status(404).json({ error: 'Chat not found' });
+  res.json(chat);
+});
+
+// POST /api/ai/chat/new — create empty chat
+app.post('/api/ai/chat/new', async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const chat = {
+    id:         `chat_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    userId,
+    title:      '',
+    messages:   [],
+    createdAt:  Date.now(),
+    updatedAt:  Date.now(),
+  };
+  await saveChat(chat);
+  res.json(chat);
+});
+
+// DELETE /api/ai/chat/:id
+app.delete('/api/ai/chat/:id', async (req, res) => {
+  await deleteChat(req.params.id);
+  res.json({ success: true });
 });
 
 // ══════════════════════════════════════════
-//  SIDEBAR
+//  OWNER ROUTES
 // ══════════════════════════════════════════
-function toggleSidebar() {
-  document.getElementById('sidebar').classList.toggle('collapsed');
-}
 
-// ══════════════════════════════════════════
-//  CHAT LIST
-// ══════════════════════════════════════════
-async function loadChatList() {
-  try {
-    const res  = await fetch(`${API}/api/ai/chats/${encodeURIComponent(userId)}`);
-    const data = await res.json();
-    renderChatList(data);
-  } catch {}
-}
+// GET prompt
+app.get('/api/owner/prompt', authOwner, async (req, res) => {
+  res.json({ prompt: await getPrompt() });
+});
 
-function renderChatList(chats) {
-  const el = document.getElementById('chat-list');
-  if (!chats || !chats.length) {
-    el.innerHTML = '<div class="chat-list-empty">No chats yet</div>';
-    return;
+// PUT prompt
+app.put('/api/owner/prompt', authOwner, async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt || prompt.length < 10) return res.status(400).json({ error: 'Prompt too short' });
+  await setPrompt(prompt);
+  res.json({ success: true });
+});
+
+// GET all chats (owner)
+app.get('/api/owner/chats', authOwner, async (req, res) => {
+  if (SUPABASE_URL) {
+    try {
+      const rows = await sbReq('GET', 'ai_chats', null, '?select=id,user_id,data&order=updated_at.desc&limit=100');
+      return res.json((rows || []).map(r => ({
+        id:           r.id,
+        userId:       r.user_id,
+        title:        r.data?.title || 'Untitled',
+        messageCount: r.data?.messages?.length || 0,
+        updatedAt:    r.data?.updatedAt,
+      })));
+    } catch {}
   }
-  el.innerHTML = '';
-  chats.forEach(chat => {
-    const item = document.createElement('div');
-    item.className = 'chat-item' + (currentChat?.id === chat.id ? ' active' : '');
-    item.dataset.id = chat.id;
-    const ago = timeAgo(chat.updatedAt);
-    item.innerHTML = `
-      <div class="chat-item-title">${esc(chat.title || 'New Chat')}</div>
-      <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;">
-        <div class="chat-item-meta">${ago}</div>
-        <button class="chat-item-del" onclick="deleteChat('${chat.id}',event)" title="Delete">✕</button>
-      </div>
-    `;
-    item.addEventListener('click', () => loadChat(chat.id));
-    el.appendChild(item);
-  });
-}
+  res.json(Object.values(_memChats).map(c => ({ id: c.id, userId: c.userId, title: c.title, messageCount: c.messages?.length || 0, updatedAt: c.updatedAt })));
+});
 
-async function loadChat(id) {
-  try {
-    const res  = await fetch(`${API}/api/ai/chat/${encodeURIComponent(id)}`);
-    const chat = await res.json();
-    if (chat.error) return;
-
-    currentChat = chat;
-    document.getElementById('header-title').textContent = chat.title || 'Chat';
-    document.getElementById('welcome').style.display = 'none';
-    document.getElementById('messages').innerHTML = '';
-
-    chat.messages.forEach(m => appendMessage(m.role, m.content, false));
-    scrollBottom();
-
-    // Update active state
-    document.querySelectorAll('.chat-item').forEach(el => el.classList.remove('active'));
-    document.querySelector(`[data-id="${id}"]`)?.classList.add('active');
-  } catch {}
-}
-
-async function startNewChat() {
-  currentChat = null;
-  document.getElementById('header-title').textContent = 'Voidex AI';
-  document.getElementById('welcome').style.display = '';
-  document.getElementById('messages').innerHTML = '';
-  document.querySelectorAll('.chat-item').forEach(el => el.classList.remove('active'));
-  document.getElementById('msg-input').focus();
-}
-
-async function deleteChat(id, e) {
-  e?.stopPropagation();
-  try {
-    await fetch(`${API}/api/ai/chat/${encodeURIComponent(id)}`, { method: 'DELETE' });
-    if (currentChat?.id === id) startNewChat();
-    loadChatList();
-  } catch {}
-}
-
-// ══════════════════════════════════════════
-//  SEND MESSAGE
-// ══════════════════════════════════════════
-async function sendMessage() {
-  const input = document.getElementById('msg-input');
-  const text  = input.value.trim();
-  if (!text || isLoading) return;
-
-  // Check usage
-  const usageRes  = await fetch(`${API}/api/ai/usage/${encodeURIComponent(userId)}`);
-  const usageData = await usageRes.json();
-  if (usageData.remaining <= 0) {
-    showLimitModal();
-    return;
+// GET usage stats (owner)
+app.get('/api/owner/usage', authOwner, async (req, res) => {
+  if (SUPABASE_URL) {
+    try {
+      const rows = await sbReq('GET', 'ai_usage', null, `?date=eq.${todayKey()}&select=user_id,count&order=count.desc&limit=50`);
+      const total = (rows || []).reduce((s, r) => s + r.count, 0);
+      return res.json({ date: todayKey(), total, users: rows || [] });
+    } catch {}
   }
+  const today = todayKey();
+  const users = Object.entries(_memLimits)
+    .filter(([k]) => k.endsWith(today))
+    .map(([k, count]) => ({ user_id: k.replace('_'+today,''), count }));
+  res.json({ date: today, total: users.reduce((s,u)=>s+u.count,0), users });
+});
 
-  input.value = '';
-  autoResize(input);
-  isLoading = true;
-  document.getElementById('send-btn').disabled = true;
+// DELETE chat (owner)
+app.delete('/api/owner/chat/:id', authOwner, async (req, res) => {
+  await deleteChat(req.params.id);
+  res.json({ success: true });
+});
 
-  // Hide welcome
-  document.getElementById('welcome').style.display = 'none';
-
-  // If no current chat, create one
-  if (!currentChat) {
-    const res  = await fetch(`${API}/api/ai/chat/new`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId }),
-    });
-    currentChat = await res.json();
+// Reset usage for user
+app.delete('/api/owner/usage/:userId', authOwner, async (req, res) => {
+  const key = `${req.params.userId}_${todayKey()}`;
+  delete _memLimits[key];
+  if (SUPABASE_URL) {
+    try { await sbReq('DELETE', 'ai_usage', null, `?key=eq.${encodeURIComponent(key)}`); } catch {}
   }
-
-  // Add user message
-  currentChat.messages = currentChat.messages || [];
-  currentChat.messages.push({ role: 'user', content: text });
-  appendMessage('user', text, true);
-  scrollBottom();
-
-  // Show thinking
-  const thinkId = showThinking();
-
-  try {
-    const response = await fetch(`${API}/api/ai/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages: currentChat.messages,
-        userId,
-        chatId: currentChat.id,
-      }),
-    });
-
-    if (!response.ok) {
-      const err = await response.json();
-      removeThinking(thinkId);
-      if (response.status === 429) { showLimitModal(); }
-      else appendMessage('ai', '⚠ Error: ' + (err.error || 'Something went wrong'), true);
-      return;
-    }
-
-    // Stream response
-    removeThinking(thinkId);
-    const aiMsgEl = appendMessage('ai', '', true);
-    const bubbleEl = aiMsgEl.querySelector('.msg-bubble');
-    bubbleEl.innerHTML = '<span class="cursor-blink"></span>';
-
-    const reader  = response.body.getReader();
-    const decoder = new TextDecoder();
-    let   full    = '';
-    let   buffer  = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') break;
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.token) {
-            full += parsed.token;
-            bubbleEl.innerHTML = formatMsg(full) + '<span class="cursor-blink"></span>';
-            scrollBottom();
-          }
-          if (parsed.error) throw new Error(parsed.error);
-        } catch {}
-      }
-    }
-
-    // Final render — remove cursor
-    bubbleEl.innerHTML = formatMsg(full);
-    currentChat.messages.push({ role: 'assistant', content: full });
-
-    // Update title if first message
-    if (!currentChat.title) {
-      currentChat.title = text.slice(0, 50) + (text.length > 50 ? '...' : '');
-      document.getElementById('header-title').textContent = currentChat.title;
-    }
-
-    loadChatList();
-    loadUsage();
-
-  } catch (err) {
-    removeThinking(thinkId);
-    appendMessage('ai', '⚠ Connection error. Please try again.', true);
-  } finally {
-    isLoading = false;
-    document.getElementById('send-btn').disabled = false;
-    document.getElementById('msg-input').focus();
-  }
-}
-
-function useSuggestion(btn) {
-  const input = document.getElementById('msg-input');
-  input.value = btn.textContent.replace(/^[⭐⚡🔄📈💎🥚]\s*/, '');
-  autoResize(input);
-  input.focus();
-  sendMessage();
-}
+  res.json({ success: true });
+});
 
 // ══════════════════════════════════════════
-//  MESSAGE RENDERING
+//  KEEPALIVE
 // ══════════════════════════════════════════
-function appendMessage(role, content, animate) {
-  const msgs = document.getElementById('messages');
-  const row  = document.createElement('div');
-  row.className = 'msg-row ' + role + (animate ? '' : ' no-anim');
+setInterval(() => {
+  http.get(`http://localhost:${PORT}/api/status`, r => { r.resume(); console.log(`[AI] Keepalive ✓ uptime:${Math.floor(process.uptime())}s`); }).on('error', ()=>{});
+}, 10 * 60 * 1000);
 
-  const avatarIcon = role === 'user' ? '👤' : '⬡';
-  row.innerHTML = `
-    <div class="msg-avatar">${avatarIcon}</div>
-    <div class="msg-bubble">${formatMsg(content)}</div>
-  `;
-  msgs.appendChild(row);
-  return row;
-}
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'frontend', 'index.html')));
 
-function formatMsg(text) {
-  if (!text) return '';
-  // Code blocks
-  text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
-    `<pre><code>${escHtml(code.trim())}</code></pre>`
-  );
-  // Inline code
-  text = text.replace(/`([^`]+)`/g, (_, c) => `<code>${escHtml(c)}</code>`);
-  // Bold
-  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  // Italic
-  text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
-  // Newlines
-  text = text.replace(/\n/g, '<br>');
-  return text;
-}
-
-function showThinking() {
-  const msgs = document.getElementById('messages');
-  const row  = document.createElement('div');
-  const id   = 'think_' + Date.now();
-  row.id = id;
-  row.className = 'msg-row ai';
-  row.innerHTML = `
-    <div class="msg-avatar">⬡</div>
-    <div class="thinking-bubble">
-      <div class="t-dot"></div><div class="t-dot"></div><div class="t-dot"></div>
-    </div>
-  `;
-  msgs.appendChild(row);
-  scrollBottom();
-  return id;
-}
-
-function removeThinking(id) {
-  document.getElementById(id)?.remove();
-}
-
-// ══════════════════════════════════════════
-//  USAGE
-// ══════════════════════════════════════════
-async function loadUsage() {
-  try {
-    const res  = await fetch(`${API}/api/ai/usage/${encodeURIComponent(userId)}`);
-    const data = await res.json();
-    const pct  = (data.usage / data.limit) * 100;
-
-    document.getElementById('usage-count').textContent = `${data.usage} / ${data.limit}`;
-    const fill = document.getElementById('usage-bar-fill');
-    fill.style.width = Math.min(pct, 100) + '%';
-    fill.className   = 'usage-bar-fill' + (pct >= 100 ? ' full' : pct >= 80 ? ' warn' : '');
-  } catch {}
-}
-
-function showLimitModal() {
-  alert('You\'ve reached the daily limit of 30 messages. Come back tomorrow!');
-}
-
-// ══════════════════════════════════════════
-//  OWNER PANEL
-// ══════════════════════════════════════════
-function openOwner() {
-  document.getElementById('owner-overlay').classList.add('open');
-  if (ownerAuthed) {
-    document.getElementById('owner-login').style.display = 'none';
-    document.getElementById('owner-dash').style.display  = 'block';
-    ownerLoadPrompt();
-  } else {
-    document.getElementById('owner-login').style.display = 'block';
-    document.getElementById('owner-dash').style.display  = 'none';
-  }
-}
-
-function closeOwner() {
-  document.getElementById('owner-overlay').classList.remove('open');
-}
-
-async function ownerLogin() {
-  const pw  = document.getElementById('owner-pw').value.trim();
-  const err = document.getElementById('owner-login-err');
-  err.style.display = 'none';
-  try {
-    const res = await fetch(`${API}/api/owner/prompt`, { headers: { 'x-owner-password': pw } });
-    if (res.status === 401) { err.textContent = 'Wrong password'; err.style.display='block'; return; }
-    const data = await res.json();
-    ownerPw     = pw;
-    ownerAuthed = true;
-    document.getElementById('owner-login').style.display = 'none';
-    document.getElementById('owner-dash').style.display  = 'block';
-    document.getElementById('prompt-editor').value = data.prompt || '';
-  } catch { err.textContent = 'Server unreachable'; err.style.display='block'; }
-}
-
-async function ownerLoadPrompt() {
-  try {
-    const res  = await fetch(`${API}/api/owner/prompt`, { headers: { 'x-owner-password': ownerPw } });
-    const data = await res.json();
-    document.getElementById('prompt-editor').value = data.prompt || '';
-  } catch {}
-}
-
-async function savePrompt() {
-  const prompt = document.getElementById('prompt-editor').value.trim();
-  const err    = document.getElementById('prompt-err');
-  err.style.display = 'none';
-  if (!prompt) { err.textContent = 'Prompt cannot be empty'; err.style.display='block'; return; }
-  try {
-    const res = await fetch(`${API}/api/owner/prompt`, {
-      method: 'PUT', headers: { 'Content-Type':'application/json', 'x-owner-password': ownerPw },
-      body: JSON.stringify({ prompt }),
-    });
-    const data = await res.json();
-    if (data.success) showToast('✔ Prompt saved');
-    else { err.textContent = data.error; err.style.display='block'; }
-  } catch { err.textContent = 'Save failed'; err.style.display='block'; }
-}
-
-function ownerTab(name, btn) {
-  document.querySelectorAll('.owner-tab').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.owner-tab-content').forEach(c => c.classList.remove('active'));
-  btn.classList.add('active');
-  document.getElementById('otab-' + name).classList.add('active');
-
-  if (name === 'stats')  ownerLoadStats();
-  if (name === 'chats')  ownerLoadChats();
-}
-
-async function ownerLoadStats() {
-  try {
-    const [statusRes, usageRes] = await Promise.all([
-      fetch(`${API}/api/status`),
-      fetch(`${API}/api/owner/usage`, { headers: { 'x-owner-password': ownerPw } }),
-    ]);
-    const status = await statusRes.json();
-    const usage  = await usageRes.json();
-
-    const el = document.getElementById('stats-content');
-    el.innerHTML = `
-      <div class="stat-card"><div class="stat-num">${usage.total || 0}</div><div class="stat-lbl">MSGS TODAY</div></div>
-      <div class="stat-card"><div class="stat-num">${(usage.users||[]).length}</div><div class="stat-lbl">USERS TODAY</div></div>
-      <div class="stat-card"><div class="stat-num">${Math.floor((status.uptime||0)/60)}m</div><div class="stat-lbl">UPTIME</div></div>
-      <div class="stat-card"><div class="stat-num">v${status.version||'?'}</div><div class="stat-lbl">VERSION</div></div>
-    `;
-
-    // Usage breakdown
-    if (usage.users && usage.users.length) {
-      const table = document.createElement('div');
-      table.style.cssText = 'margin-top:1rem;';
-      table.innerHTML = '<div style="font-size:.7rem;font-weight:700;letter-spacing:.1em;color:var(--tm);margin-bottom:.5rem;">USER USAGE TODAY</div>';
-      usage.users.forEach(u => {
-        const row = document.createElement('div');
-        row.style.cssText = 'display:flex;justify-content:space-between;padding:.4rem .5rem;border-bottom:1px solid var(--b);font-size:.82rem;';
-        row.innerHTML = `<span style="color:var(--td);font-family:'Share Tech Mono',monospace;">${esc(u.user_id?.slice(0,20)||'?')}</span><span style="color:var(--rg);font-weight:700;">${u.count} msgs</span>`;
-        table.appendChild(row);
-      });
-      el.appendChild(table);
-    }
-  } catch {}
-}
-
-async function ownerLoadChats() {
-  try {
-    const res   = await fetch(`${API}/api/owner/chats`, { headers: { 'x-owner-password': ownerPw } });
-    const chats = await res.json();
-    const el    = document.getElementById('owner-chats-list');
-
-    if (!chats.length) { el.innerHTML = '<div style="color:var(--tm);font-size:.85rem;padding:.8rem 0;">No chats yet</div>'; return; }
-
-    el.innerHTML = `<div style="font-size:.7rem;font-weight:700;letter-spacing:.1em;color:var(--tm);margin-bottom:.5rem;">${chats.length} TOTAL CHATS</div>`;
-    chats.forEach(c => {
-      const row = document.createElement('div');
-      row.className = 'owner-chat-row';
-      row.innerHTML = `
-        <div class="ocr-title">${esc(c.title||'Untitled')}</div>
-        <div class="ocr-meta">${c.messageCount} msgs · ${timeAgo(c.updatedAt)}</div>
-        <button class="ocr-del" onclick="ownerDeleteChat('${c.id}',this)">Delete</button>
-      `;
-      el.appendChild(row);
-    });
-  } catch {}
-}
-
-async function ownerDeleteChat(id, btn) {
-  try {
-    await fetch(`${API}/api/owner/chat/${encodeURIComponent(id)}`, {
-      method: 'DELETE', headers: { 'x-owner-password': ownerPw },
-    });
-    btn.closest('.owner-chat-row')?.remove();
-    showToast('Chat deleted');
-  } catch {}
-}
-
-// ══════════════════════════════════════════
-//  HELPERS
-// ══════════════════════════════════════════
-function handleKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-}
-
-function autoResize(el) {
-  el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
-}
-
-function scrollBottom() {
-  const ca = document.getElementById('chat-area');
-  ca.scrollTop = ca.scrollHeight;
-}
-
-function esc(str) {
-  return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-function escHtml(str) { return esc(str); }
-
-function timeAgo(ts) {
-  if (!ts) return '';
-  const diff = Date.now() - new Date(ts).getTime();
-  const m = Math.floor(diff / 60000);
-  const h = Math.floor(m / 60);
-  const d = Math.floor(h / 24);
-  if (d > 0) return d + 'd';
-  if (h > 0) return h + 'h';
-  if (m > 0) return m + 'm';
-  return 'now';
-}
-
-let toastTimer;
-function showToast(msg) {
-  const existing = document.querySelector('.toast');
-  if (existing) existing.remove();
-  clearTimeout(toastTimer);
-  const t = document.createElement('div');
-  t.className = 'toast';
-  t.textContent = msg;
-  t.style.cssText = 'position:fixed;bottom:1.5rem;left:50%;transform:translateX(-50%);background:var(--card2);border:1px solid var(--b2);border-radius:7px;padding:.55rem 1.3rem;font-size:.88rem;font-weight:600;color:#fff;z-index:9000;white-space:nowrap;box-shadow:0 4px 16px rgba(0,0,0,.4);';
-  document.body.appendChild(t);
-  toastTimer = setTimeout(() => { t.style.opacity='0'; t.style.transition='opacity .25s'; setTimeout(()=>t.remove(),280); }, 2200);
-}
+app.listen(PORT, () => {
+  console.log(`╔══════════════════════════════════════╗`);
+  console.log(`║   VOIDEX AI v${VERSION} — ONLINE          ║`);
+  console.log(`║   Model: Llama 3.3 70B (Groq)        ║`);
+  console.log(`║   Made by Aousisgood1                ║`);
+  console.log(`╚══════════════════════════════════════╝`);
+});
