@@ -242,16 +242,26 @@ function callGroq(messages, stream, res) {
         res.setHeader('Connection',    'keep-alive');
         res.flushHeaders();
 
-        let full = '';
+        let full    = '';
+        let done    = false;
+        let linesBuf = '';
+
         groqRes.on('data', (chunk) => {
-          const lines = chunk.toString().split('\n');
+          if (done) return;
+          linesBuf += chunk.toString();
+          const lines = linesBuf.split('\n');
+          // Keep the last (potentially incomplete) line in the buffer
+          linesBuf = lines.pop();
+
           for (const line of lines) {
+            if (done) break;
             if (!line.startsWith('data: ')) continue;
             const data = line.slice(6).trim();
             if (data === '[DONE]') {
+              done = true;
               res.write(`data: [DONE]\n\n`);
               resolve(full);
-              return;
+              break;
             }
             try {
               const parsed = JSON.parse(data);
@@ -263,7 +273,9 @@ function callGroq(messages, stream, res) {
             } catch {}
           }
         });
-        groqRes.on('end', () => resolve(full));
+        groqRes.on('end', () => {
+          if (!done) resolve(full);
+        });
         groqRes.on('error', reject);
       }
     });
@@ -319,10 +331,15 @@ app.post('/api/ai/chat', async (req, res) => {
     // Increment usage before calling (prevents abuse)
     const newUsage = await incrementUsage(userId);
 
-    // Stream response
+    // Stream response — callGroq writes SSE tokens directly to res
     const fullResponse = await callGroq(fullMessages, true, res);
 
-    // Save/update chat
+    // End the SSE stream exactly once, after streaming is complete
+    if (!res.writableEnded) res.end();
+
+    // Save/update chat with the final, complete message list
+    // messages[] already contains the full conversation history including
+    // the latest user message; append only the assistant reply here.
     if (chatId) {
       const existing = await getChat(chatId) || { id: chatId, userId, title: '', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
 
@@ -332,13 +349,12 @@ app.post('/api/ai/chat', async (req, res) => {
         existing.title = firstMsg ? firstMsg.content.slice(0, 50) + (firstMsg.content.length > 50 ? '...' : '') : 'New Chat';
       }
 
-      existing.messages   = [...messages, { role: 'assistant', content: fullResponse }];
-      existing.updatedAt  = Date.now();
+      // Use the messages array from the request (which includes the user's
+      // latest message) and append the assistant response exactly once.
+      existing.messages  = [...messages, { role: 'assistant', content: fullResponse }];
+      existing.updatedAt = Date.now();
       await saveChat(existing);
     }
-
-    // If streaming already ended the response, we're done
-    if (!res.writableEnded) res.end();
 
   } catch (err) {
     console.error('[AI] Chat error:', err.message);
