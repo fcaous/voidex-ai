@@ -465,7 +465,7 @@ async function ownerDeleteChat(id, btn) {
 //  HELPERS
 // ══════════════════════════════════════════
 function handleKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); sendMessage(); }
 }
 
 function autoResize(el) {
