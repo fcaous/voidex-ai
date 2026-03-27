@@ -224,7 +224,6 @@ async function sendMessage() {
 
     // Final render — remove cursor
     bubbleEl.innerHTML = formatMsg(full);
-    currentChat.messages.push({ role: 'assistant', content: full });
 
     // Update title if first message
     if (!currentChat.title) {
